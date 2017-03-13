@@ -14,10 +14,31 @@ const unsigned printIntervalMilliSeconds = 500;
 
 unsigned long printTimestamp;
 
+//////////////////// stav programu
+
+enum deviceState {
+  stateMeasuring = 1,
+  stateCalibratingPH = 2,
+  stateCalibratingEC = 3,
+} deviceState = stateMeasuring;
+
+enum buttonPressed {
+  btnNone,
+  btnOK,
+  btnCancel,
+  btnCalibratePH,
+  btnCalibrateEC,
+} buttonPressed = btnNone;
+
 //////////////////// promenne k ph ////////////////////
-const unsigned receivedBufferLength = 20;
-char receivedBuffer[receivedBufferLength + 1]; // store the serial command
-byte receivedBufferIndex = 0;
+
+enum phCalibrationState {
+  phcsDone,
+  phcsUse7,
+  phcsCalibrating7,
+  phcsUse4,
+  phcsCalibrating4,
+} phCalibrationState;
 
 const unsigned phSampleCount = 30;           // sum of sample point
 int phSampleBuffer[phSampleCount];    //store the sample voltage
@@ -27,7 +48,12 @@ const unsigned phEepromSlopeAddress = 0;     // (slope of the ph probe)store at 
 const unsigned phEepromInterceptAddress = phEepromSlopeAddress+4; //phEepromSlopeAddress+sizeof(float)?
 float phSlope = 3.5;
 float phIntercept = 0.0;
-float phAverageVoltage;
+float phAverageVoltage; //FIXME proc je to float?
+
+int phCalVoltage7;
+int phCalVoltage4;
+const unsigned phCalibrationWaitInterval = 15 * 1000; //wait 15 seconds before reading buffer solution voltage
+unsigned long phCalibrationWaitStart;
 
 const unsigned phSampleInterval = 40;
 unsigned long phSampleTimestamp;
@@ -75,19 +101,129 @@ int getMedianNum(int bArray[], int iFilterLen)
       }
     }
   }
-  if ((iFilterLen & 1) > 0)
+  if ((iFilterLen & 1) > 0) {
     bTemp = bTab[(iFilterLen - 1) / 2];
-  else
+  } else {
     bTemp = (bTab[iFilterLen / 2] + bTab[iFilterLen / 2 - 1]) / 2;
+  }
   return bTemp;
 }
 
 void SamplePH() {
   phSampleBuffer[phSampleBufferIndex] = analogRead(phSensorPin) / 1024.0 * voltageReferenceMiliVolts; //read the voltage and store into the buffer,every 40ms
   phSampleBufferIndex++;
-  if (phSampleBufferIndex == phSampleCount)
+  if (phSampleBufferIndex == phSampleCount) {
     phSampleBufferIndex = 0;
+  }
   phAverageVoltage = getMedianNum(phSampleBuffer, phSampleCount);  // read the stable value by the median filtering algorithm
+}
+
+void SetupPH()
+{
+    EEPROM_read(phEepromSlopeAddress, phSlope);
+    EEPROM_read(phEepromInterceptAddress, phIntercept);
+    if(EEPROM.read(phEepromSlopeAddress)==0xFF && EEPROM.read(phEepromSlopeAddress+1)==0xFF && EEPROM.read(phEepromSlopeAddress+2)==0xFF && EEPROM.read(phEepromSlopeAddress+3)==0xFF)
+    {
+      phSlope = 3.5; //but why?
+      EEPROM_write(phEepromSlopeAddress, phSlope);
+    }
+    if(EEPROM.read(phEepromInterceptAddress)==0xFF && EEPROM.read(phEepromInterceptAddress+1)==0xFF && EEPROM.read(phEepromInterceptAddress+2)==0xFF && EEPROM.read(phEepromInterceptAddress+3)==0xFF)
+    {
+      phIntercept = 0;
+      EEPROM_write(phEepromInterceptAddress, phIntercept);
+    }
+}
+
+void PHCalibrationRefresh()
+{
+  switch(phCalibrationState)
+  {
+  case phcsUse7:
+    Serial.println("put into pH=7");
+    Serial.println("and press OK");
+    break;
+  case phcsCalibrating7:
+    if (waited_for(phCalibrationWaitInterval, &phCalibrationWaitStart))
+    {
+      phCalVoltage7 = phAverageVoltage;
+      phCalibrationState = phcsUse4;
+    }
+    else
+    {
+      Serial.print("U=");
+      Serial.print(phAverageVoltage);
+      Serial.println(" mV");
+      Serial.println("wait ...");
+    }
+    break;
+  case phcsUse4:
+    Serial.println("put into pH=4");
+    Serial.println("and press OK");
+    break;
+  case phcsCalibrating4:
+    if (waited_for(phCalibrationWaitInterval, &phCalibrationWaitStart))
+    {
+      phCalVoltage4 = phAverageVoltage;
+
+      // spocitat parametry a ulozit do pameti
+      phSlope = -3.0 / (float)(phCalVoltage4 - phCalVoltage7); //(4 - 7) / (U_4 - U_7)
+      phIntercept = 7 - phSlope * phCalVoltage7;
+      EEPROM_write(phEepromSlopeAddress, phSlope);
+      EEPROM_write(phEepromInterceptAddress, phIntercept);
+
+      phCalibrationState = phcsDone;
+      phCalibrationWaitStart = millis();
+    }
+    else
+    {
+      Serial.print("U=");
+      Serial.print(phAverageVoltage);
+      Serial.println(" mV");
+      Serial.println("wait ...");
+    }
+    break;
+  case phcsDone:
+    // po pul seknude se vratit to rezimu mereni
+    if (waited_for(500, &phCalibrationWaitStart))
+    {
+      deviceState = stateMeasuring;
+    }
+    else
+    {
+      Serial.println("Calibration done");
+      Serial.print("sl: ");
+      Serial.print(phSlope);
+      Serial.print(" in: ");
+      Serial.println(phIntercept);
+    }
+    break;
+  }
+}
+
+void PHCalibrationButtonPressed(int btn) //why the FUCK can't i use enum buttonPressed instead of int?
+{
+  if (btn == btnCancel)
+  {
+    deviceState = stateMeasuring;
+    return;
+  }
+
+  if (btn != btnOK)
+  {
+    return;
+  }
+
+  switch(phCalibrationState)
+  {
+  case phcsUse7:
+    phCalibrationState = phcsCalibrating7;
+    phCalibrationWaitStart = millis();
+    break;
+  case phcsUse4:
+    phCalibrationState = phcsCalibrating4;
+    phCalibrationWaitStart = millis();
+    break;
+  }
 }
 
 //////////////////// funkce k ec+temp ////////////////////
@@ -209,7 +345,7 @@ bool waited_for(const unsigned interval, unsigned long *timestamp)
   {
     *timestamp = millis();
   }
-  
+
   if (millis() - *timestamp >= interval)
   {
     *timestamp = millis();
@@ -221,6 +357,7 @@ bool waited_for(const unsigned interval, unsigned long *timestamp)
 void setup() {
   Serial.begin(115200);
   ///////////////////// inicializovat ph /////////////////////
+  SetupPH();
 
   ///////////////////// inicializovat ec+teplotu /////////////////////
   SetupEC();
@@ -251,10 +388,41 @@ void loop() {
     SampleTemp();
   }
 
+  // TODO zjistit jestli bylo stisknuto tlacitko a ulozit do buttonPressed
 
-  //////////////////// vypsat na seriak ////////////////////
-  if(waited_for(printIntervalMilliSeconds, &printTimestamp))
+  if (buttonPressed != btnNone)
   {
-    PrintValues();
+    switch(deviceState)
+    {
+    case stateMeasuring:
+      if (buttonPressed == btnCalibratePH) {
+        deviceState = stateCalibratingPH;
+        phCalibrationState = phcsUse7;
+        PHCalibrationRefresh();
+      }
+      break;
+    case stateCalibratingPH:
+      PHCalibrationButtonPressed(buttonPressed);
+      break;
+    }
+  }
+  else
+  {
+    switch(deviceState)
+    {
+    case stateMeasuring:
+      //////////////////// vypsat na seriak ////////////////////
+      if(waited_for(printIntervalMilliSeconds, &printTimestamp))
+      {
+        PrintValues();
+      }
+      break;
+    case stateCalibratingPH:
+      if(waited_for(printIntervalMilliSeconds, &printTimestamp))
+      {
+        PHCalibrationRefresh();
+      }
+      break;
+    }
   }
 }
