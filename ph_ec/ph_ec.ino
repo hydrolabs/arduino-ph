@@ -1,5 +1,7 @@
 #include <EEPROM.h>
 #include <OneWire.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h> // knihovna z https://bitbucket.org/fmalpartida/new-liquidcrystal/downloads
 
 #define EEPROM_write(address, p) {int i = 0; byte *pp = (byte*)&(p);for(; i < sizeof(p); i++) EEPROM.write(address+i, pp[i]);}
 #define EEPROM_read(address, p)  {int i = 0; byte *pp = (byte*)&(p);for(; i < sizeof(p); i++) pp[i]=EEPROM.read(address+i);}
@@ -8,7 +10,13 @@
 
 const byte phSensorPin = A1;
 const byte ecSensorPin = A0;
-const byte ds18b20Pin = 2; //1-wire temp sensor
+const byte ds18b20Pin = 10; //1-wire temp sensor
+
+const byte btnPinOK = 4;
+const byte btnPinCalPH = 2;
+const byte btnPinCalEC = 5;
+const byte btnPinCancel = 3;
+
 const unsigned voltageReferenceMiliVolts = 5000;
 const unsigned printIntervalMilliSeconds = 500;
 
@@ -79,6 +87,10 @@ unsigned long ecSampleTimestamp, tempSampleTime;
 //Temperature chip i/o
 OneWire tempSensor(ds18b20Pin);
 
+// vytvoří objekt lcd a nastaví jeho adresu
+// 0x20 a 16 zanků na 2 řádcích
+LiquidCrystal_I2C lcd(0x27, 2, 1, 0, 4, 5, 6, 7);
+
 //////////////////// funkce k ph ////////////////////
 
 int getMedianNum(int bArray[], int iFilterLen)
@@ -139,8 +151,10 @@ void PHCalibrationRefresh()
   switch(phCalibrationState)
   {
   case phcsUse7:
-    Serial.println("put into pH=7");
-    Serial.println("and press OK");
+    lcd.clear();
+    lcd.print("put into pH=7");
+    lcd.setCursor(0, 1);
+    lcd.print("and press OK");
     break;
   case phcsCalibrating7:
     if (waited_for(phCalibrationWaitInterval, &phCalibrationWaitStart))
@@ -150,15 +164,19 @@ void PHCalibrationRefresh()
     }
     else
     {
-      Serial.print("U=");
-      Serial.print(phAverageVoltage);
-      Serial.println(" mV");
-      Serial.println("wait ...");
+      lcd.clear();
+      lcd.print("U=");
+      lcd.print(phAverageVoltage);
+      lcd.print(" mV");
+      lcd.setCursor(0, 1);
+      lcd.print("wait ...");
     }
     break;
   case phcsUse4:
-    Serial.println("put into pH=4");
-    Serial.println("and press OK");
+    lcd.clear();
+    lcd.print("put into pH=4");
+    lcd.setCursor(0, 1);
+    lcd.print("and press OK");
     break;
   case phcsCalibrating4:
     if (waited_for(phCalibrationWaitInterval, &phCalibrationWaitStart))
@@ -166,8 +184,8 @@ void PHCalibrationRefresh()
       phCalVoltage4 = phAverageVoltage;
 
       // spocitat parametry a ulozit do pameti
-      phSlope = -3.0 / (float)(phCalVoltage4 - phCalVoltage7); //(4 - 7) / (U_4 - U_7)
-      phIntercept = 7 - phSlope * phCalVoltage7;
+      phSlope = -3.0 / ((phCalVoltage4 - phCalVoltage7)/1000.0); //(4 - 7) / (U_4 - U_7)
+      phIntercept = 7 - phSlope * (phCalVoltage7/1000.0);
       EEPROM_write(phEepromSlopeAddress, phSlope);
       EEPROM_write(phEepromInterceptAddress, phIntercept);
 
@@ -176,25 +194,29 @@ void PHCalibrationRefresh()
     }
     else
     {
-      Serial.print("U=");
-      Serial.print(phAverageVoltage);
-      Serial.println(" mV");
-      Serial.println("wait ...");
+      lcd.clear();
+      lcd.print("U=");
+      lcd.print(phAverageVoltage);
+      lcd.print(" mV");
+      lcd.setCursor(0, 1);
+      lcd.print("wait ...");
     }
     break;
   case phcsDone:
     // po pul seknude se vratit to rezimu mereni
-    if (waited_for(500, &phCalibrationWaitStart))
+    if (waited_for(2500, &phCalibrationWaitStart))
     {
       deviceState = stateMeasuring;
     }
     else
     {
-      Serial.println("Calibration done");
-      Serial.print("sl: ");
-      Serial.print(phSlope);
-      Serial.print(" in: ");
-      Serial.println(phIntercept);
+      lcd.clear();
+      lcd.print("Calibration done");
+      lcd.setCursor(0, 1);
+      lcd.print("sl: ");
+      lcd.print(phSlope);
+      lcd.print(" in: ");
+      lcd.print(phIntercept);
     }
     break;
   }
@@ -254,17 +276,8 @@ void SampleTemp() {
   TempProcess(tempCommandStartConvert);                   //after the reading,start the convert for next reading
 }
 
-void PrintEC() {
-
+void ComputeEC() {
   ecAverageVoltage = ecAnalogAverage * (float)5000 / 1024;
-  Serial.print("Analog value:");
-  Serial.print(ecAnalogAverage);   //analog average,from 0 to 1023
-  Serial.print("    Voltage:");
-  Serial.print(ecAverageVoltage);  //millivolt average,from 0mv to 4995mV
-  Serial.print("mV    ");
-  Serial.print("temp:");
-  Serial.print(tempCurrent);    //current temperature
-  Serial.print("^C     EC:");
 
   float TempCoefficient = 1.0 + 0.0185 * (tempCurrent - 25.0); //temperature compensation formula: fFinalResult(25^C) = fFinalResult(current)/(1.0+0.0185*(fTP-25.0));
   float CoefficientVolatge = (float)ecAverageVoltage / TempCoefficient;
@@ -275,9 +288,9 @@ void PrintEC() {
     if (CoefficientVolatge <= 448)ecCurrent = 6.84 * CoefficientVolatge - 64.32; //1ms/cm<EC<=3ms/cm
     else if (CoefficientVolatge <= 1457)ecCurrent = 6.98 * CoefficientVolatge - 127; //3ms/cm<EC<=10ms/cm
     else ecCurrent = 5.3 * CoefficientVolatge + 2278;                     //10ms/cm<EC<20ms/cm
-    ecCurrent /= 1000;  //convert us/cm to ms/cm
+    //ecCurrent /= 1000;  //convert us/cm to ms/cm
     Serial.print(ecCurrent, 2); //two decimal
-    Serial.println("ms/cm");
+    Serial.println("us/cm");
   }
 }
 
@@ -328,14 +341,25 @@ float TempProcess(int command)
 
 //////////////////// dalsi funkce ////////////////////
 void PrintValues() {
+  float phCurrent = phAverageVoltage / 1000.0 * phSlope + phIntercept;
+  ComputeEC();
+  
   Serial.print("Voltage:");
   Serial.print(phAverageVoltage);
   Serial.println("mV");
 
   Serial.print("pH:");              // in normal mode, print the ph value to user
-  Serial.println(phAverageVoltage / 1000.0 * phSlope + phIntercept);
+  Serial.println(phCurrent);
 
-  PrintEC();
+  lcd.clear();
+  lcd.print("pH");
+  lcd.print(phCurrent);
+  lcd.print(" t=");
+  lcd.print(tempCurrent);
+  lcd.setCursor(0, 1);
+  lcd.print("EC");
+  lcd.print(ecCurrent);
+  lcd.print("uS/cm");
 }
 
 
@@ -356,6 +380,12 @@ bool waited_for(const unsigned interval, unsigned long *timestamp)
 
 void setup() {
   Serial.begin(115200);
+  lcd.begin(16,2);
+  lcd.backlight();
+  pinMode(btnPinOK, INPUT_PULLUP);
+  pinMode(btnPinCalPH, INPUT_PULLUP);
+  pinMode(btnPinCalEC, INPUT_PULLUP);
+  pinMode(btnPinCancel, INPUT_PULLUP);
   ///////////////////// inicializovat ph /////////////////////
   SetupPH();
 
@@ -388,7 +418,23 @@ void loop() {
     SampleTemp();
   }
 
+  buttonPressed = btnNone;
   // TODO zjistit jestli bylo stisknuto tlacitko a ulozit do buttonPressed
+  if (digitalRead(btnPinOK) == LOW) {
+    buttonPressed = btnOK;
+  } else if (digitalRead(btnPinCalPH) == LOW) {
+    buttonPressed = btnCalibratePH;
+  } else if (digitalRead(btnPinCalEC) == LOW) {
+    buttonPressed = btnCalibrateEC;
+  } else if (digitalRead(btnPinCancel) == LOW) {
+    buttonPressed = btnCancel;
+  }
+/*
+  if (buttonPressed != btnNone) {
+    Serial.print(buttonPressed);
+    delay(200);
+  }
+  */
 
   if (buttonPressed != btnNone)
   {
