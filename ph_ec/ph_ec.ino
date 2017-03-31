@@ -38,6 +38,9 @@ enum buttonPressed {
   btnCalibrateEC,
 } buttonPressed = btnNone;
 
+unsigned long debounceTimestamp;
+const unsigned debounceInterval = 50;
+
 //////////////////// promenne k ph ////////////////////
 
 enum phCalibrationState {
@@ -73,6 +76,14 @@ enum {
   tempCommandReadTemperature = 1,
 };
 
+enum ecCalibrationState {
+  eccsDone,
+  eccsUseA,
+  eccsCalibratingA,
+  eccsUseB,
+  eccsCalibratingB,
+} ecCalibrationState;
+
 const byte ecSampleCount = 20;     //the number of sample times
 unsigned int ecSampleBuffer[ecSampleCount];      // the readings from the analog input
 byte ecSampleBufferIndex = 0;                  // the index of the current reading
@@ -83,6 +94,20 @@ float tempCurrent, ecCurrent;
 const unsigned ecSampleInterval = 25;
 const unsigned tempSampleInterval = 850;
 unsigned long ecSampleTimestamp, tempSampleTime;
+
+const unsigned ecEepromSlopeAddress = phEepromInterceptAddress+4;
+const unsigned ecEepromInterceptAddress = ecEepromSlopeAddress+4;
+const unsigned ecEepromCalibratedTempAddress = ecEepromInterceptAddress+4;
+float ecSlope = 6.84;
+float ecIntercept = -64.32;
+float ecCalibratedTemp = 25.0;
+
+const unsigned ecCalConductivityA = 1413;  // us/cm
+const unsigned ecCalConductivityB = 12880; // us/cm
+int ecCalVoltageA;
+int ecCalVoltageB;
+const unsigned ecCalibrationWaitInterval = 15 * 1000;
+unsigned long ecCalibrationWaitStart;
 
 //Temperature chip i/o
 OneWire tempSensor(ds18b20Pin);
@@ -259,6 +284,7 @@ void SampleEC() {    // subtract the last reading:
   ecAnalogValueTotal = ecAnalogValueTotal - ecSampleBuffer[ecSampleBufferIndex];
   // read from the sensor:
   ecSampleBuffer[ecSampleBufferIndex] = analogRead(ecSensorPin);
+  Serial.println(ecSampleBuffer[ecSampleBufferIndex]);
   // add the reading to the total:
   ecAnalogValueTotal = ecAnalogValueTotal + ecSampleBuffer[ecSampleBufferIndex];
   // advance to the next position in the array:
@@ -269,6 +295,7 @@ void SampleEC() {    // subtract the last reading:
     ecSampleBufferIndex = 0;
   // calculate the average:
   ecAnalogAverage = ecAnalogValueTotal / ecSampleCount;
+  ecAverageVoltage = ecAnalogAverage * (float)5000 / 1024;
 }
 
 void SampleTemp() {
@@ -277,8 +304,6 @@ void SampleTemp() {
 }
 
 void ComputeEC() {
-  ecAverageVoltage = ecAnalogAverage * (float)5000 / 1024;
-
   float TempCoefficient = 1.0 + 0.0185 * (tempCurrent - 25.0); //temperature compensation formula: fFinalResult(25^C) = fFinalResult(current)/(1.0+0.0185*(fTP-25.0));
   float CoefficientVolatge = (float)ecAverageVoltage / TempCoefficient;
   if (CoefficientVolatge < 150)Serial.println("No solution!"); //25^C 1413us/cm<-->about 216mv  if the voltage(compensate)<150,that is <1ms/cm,out of the range
@@ -337,6 +362,116 @@ float TempProcess(int command)
     Serial.println("Unknown command!");
   }
   return TemperatureSum;
+}
+
+void ECCalibrationRefresh()
+{
+  switch(ecCalibrationState)
+  {
+  case eccsUseA:
+    lcd.clear();
+    lcd.print("put into ");
+    lcd.print(ecCalConductivityA);
+    lcd.print("us");
+    lcd.setCursor(0, 1);
+    lcd.print("and press OK");
+    break;
+  case eccsCalibratingA:
+    if (waited_for(ecCalibrationWaitInterval, &ecCalibrationWaitStart))
+    {
+      ecCalVoltageA = ecAverageVoltage;
+      ecCalibrationState = eccsUseB;
+    }
+    else
+    {
+      lcd.clear();
+      lcd.print("U=");
+      lcd.print(ecAverageVoltage);
+      lcd.print(" mV");
+      lcd.setCursor(0, 1);
+      lcd.print("wait ...");
+    }
+    break;
+  case eccsUseB:
+    lcd.clear();
+    lcd.print("put into ");
+    lcd.print(ecCalConductivityB);
+    lcd.print("us");
+    lcd.setCursor(0, 1);
+    lcd.print("and press OK");
+    break;
+  case eccsCalibratingB:
+    if (waited_for(ecCalibrationWaitInterval, &ecCalibrationWaitStart))
+    {
+      ecCalVoltageB = ecAverageVoltage;
+
+      // spocitat parametry a ulozit do pameti
+      ecSlope = (ecCalConductivityB - ecCalConductivityA) / ((ecCalVoltageB - ecCalVoltageA)/1000.0);
+      ecIntercept = ecCalConductivityA - ecSlope * (ecCalVoltageA/1000.0);
+      ecCalibratedTemp = tempCurrent;
+      EEPROM_write(ecEepromSlopeAddress, ecSlope);
+      EEPROM_write(ecEepromInterceptAddress, ecIntercept);
+      EEPROM_write(ecEepromCalibratedTempAddress, ecCalibratedTemp);
+
+      ecCalibrationState = eccsDone;
+      ecCalibrationWaitStart = millis();
+    }
+    else
+    {
+      lcd.clear();
+      lcd.print("U=");
+      lcd.print(ecAverageVoltage);
+      lcd.print(" mV");
+      lcd.setCursor(0, 1);
+      lcd.print("wait ...");
+    }
+    break;
+  case eccsDone:
+    // po pul seknude se vratit to rezimu mereni
+    if (waited_for(2500, &ecCalibrationWaitStart))
+    {
+      deviceState = stateMeasuring;
+    }
+    else
+    {
+      lcd.clear();
+      lcd.print("Calibration done");
+      lcd.setCursor(0, 1);
+      lcd.print("sl: ");
+      lcd.print(ecSlope);
+      lcd.print(" in: ");
+      lcd.print(ecIntercept);
+      lcd.print(" t: ");
+      lcd.print(ecCalibratedTemp);
+    }
+    break;
+  }
+}
+
+void ECCalibrationButtonPressed(int btn)
+{
+  if (btn == btnCancel)
+  {
+    deviceState = stateMeasuring;
+    return;
+  }
+
+  if (btn != btnOK)
+  {
+    return;
+  }
+
+  switch(ecCalibrationState)
+  {
+  case eccsUseA:
+    ecCalibrationState = eccsCalibratingA;
+    ecCalibrationWaitStart = millis();
+    break;
+  case eccsUseB:
+    ecCalibrationState = eccsCalibratingB;
+    ecCalibrationWaitStart = millis();
+    break;
+  }
 }
 
 //////////////////// dalsi funkce ////////////////////
@@ -429,12 +564,6 @@ void loop() {
   } else if (digitalRead(btnPinCancel) == LOW) {
     buttonPressed = btnCancel;
   }
-/*
-  if (buttonPressed != btnNone) {
-    Serial.print(buttonPressed);
-    delay(200);
-  }
-  */
 
   if (buttonPressed != btnNone)
   {
@@ -445,10 +574,17 @@ void loop() {
         deviceState = stateCalibratingPH;
         phCalibrationState = phcsUse7;
         PHCalibrationRefresh();
+      } else if (buttonPressed == btnCalibrateEC) {
+        deviceState = stateCalibratingEC;
+        ecCalibrationState = eccsUseA;
+        ECCalibrationRefresh();
       }
       break;
     case stateCalibratingPH:
       PHCalibrationButtonPressed(buttonPressed);
+      break;
+    case stateCalibratingEC:
+      ECCalibrationButtonPressed(buttonPressed);
       break;
     }
   }
@@ -467,6 +603,12 @@ void loop() {
       if(waited_for(printIntervalMilliSeconds, &printTimestamp))
       {
         PHCalibrationRefresh();
+      }
+      break;
+    case stateCalibratingEC:
+      if(waited_for(printIntervalMilliSeconds, &printTimestamp))
+      {
+        ECCalibrationRefresh();
       }
       break;
     }
